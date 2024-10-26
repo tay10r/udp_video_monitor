@@ -8,7 +8,10 @@
 #include <uv.h>
 
 #include "stb_image.h"
+#include "stb_image_write.h"
 
+#include <chrono>
+#include <filesystem>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -21,6 +24,10 @@
 #endif
 
 namespace {
+
+using utc_clock = std::chrono::utc_clock;
+
+using utc_time = std::chrono::utc_clock::time_point;
 
 struct config final
 {
@@ -170,11 +177,12 @@ public:
 class jpg_response final : public response_base<jpg_response>
 {
 public:
-  jpg_response(unsigned char* data, int w, int h, std::string source_ip)
+  jpg_response(unsigned char* data, int w, int h, std::string source_ip, utc_time timestamp)
     : m_data(data)
     , m_width(w)
     , m_height(h)
     , m_source_ip(std::move(source_ip))
+    , m_timestamp(timestamp)
   {
   }
 
@@ -188,6 +196,8 @@ public:
 
   [[nodiscard]] auto source_ip() const -> const std::string& { return m_source_ip; }
 
+  [[nodiscard]] auto timestamp() const -> utc_time { return m_timestamp; }
+
 private:
   unsigned char* m_data{ nullptr };
 
@@ -196,6 +206,8 @@ private:
   int m_height{};
 
   std::string m_source_ip;
+
+  utc_time m_timestamp;
 };
 
 class discovery_response final : public response_base<discovery_response>
@@ -381,6 +393,8 @@ protected:
 
   auto handle_jpeg(const sockaddr* sender) -> bool
   {
+    const auto timestamp = utc_clock::now();
+
     if (m_read_buffer.size() < 4) {
       return false;
     }
@@ -393,11 +407,11 @@ protected:
 
     int w = 0;
     int h = 0;
-    auto* data = stbi_load_from_memory(m_read_buffer.data() + 4, m_read_buffer.size() - 4, &w, &h, nullptr, 3);
+    auto* data = stbi_load_from_memory(m_read_buffer.data() + 4, m_read_buffer.size() - 4, &w, &h, nullptr, 1);
     if (!data) {
       return false;
     }
-    auto r = std::make_unique<jpg_response>(data, w, h, std::move(ip));
+    auto r = std::make_unique<jpg_response>(data, w, h, std::move(ip), timestamp);
     add_response(std::move(r));
     return true;
   }
@@ -522,6 +536,19 @@ struct stream_context final
    */
   float timeout{ 1.0f };
 
+  /**
+   * @brief Whether to record frames.
+   */
+  bool record{ false };
+
+  /**
+   * @brief The aspect ratio of the image.
+   */
+  float aspect{ 1.0F };
+
+  /**
+   * @brief The OpenGL texture containing the latest frame data.
+   */
   GLuint texture{};
 
   ImPlotContext* context{};
@@ -602,11 +629,24 @@ protected:
       request_new_frame(ip, ctx);
     }
 
+    if (ImGui::Button(ctx.record ? "Stop Recording" : "Start Recording")) {
+      ctx.record = !ctx.record;
+    }
+
+    ImGui::SameLine();
+
+    ImGui::Text("Time since update: %.2f [sec]", ctx.time_since_update);
+
+    ImGui::Separator();
+
     if (ImPlot::BeginPlot("##Plot", ImVec2(-1, -1), ImPlotFlags_NoFrame | ImPlotFlags_NoLegend | ImPlotFlags_Equal)) {
 
       ImPlot::SetupAxes("", "", ImPlotAxisFlags_NoDecorations, ImPlotAxisFlags_NoDecorations);
 
-      ImPlot::PlotImage("##Image", reinterpret_cast<ImTextureID>(ctx.texture), ImPlotPoint(0, 0), ImPlotPoint(1, 1));
+      ImPlot::PlotImage("##Image",
+                        reinterpret_cast<ImTextureID>(ctx.texture),
+                        ImPlotPoint(-ctx.aspect * 0.5F, 0),
+                        ImPlotPoint(ctx.aspect * 0.5F, 1));
 
       ImPlot::EndPlot();
     }
@@ -646,13 +686,46 @@ protected:
 
     it->second->time_since_update = 0.0f;
 
+    it->second->aspect = static_cast<float>(r.width()) / static_cast<float>(r.height());
+
     glBindTexture(GL_TEXTURE_2D, it->second->texture);
 
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, r.width(), r.height(), 0, GL_RGB, GL_UNSIGNED_BYTE, r.data());
+    const auto* bw_data = r.data();
+    std::vector<std::uint8_t> rgb_data(r.width() * r.height() * 3);
+    for (std::size_t i = 0; i < r.width() * r.height(); i++) {
+      rgb_data[i * 3 + 0] = bw_data[i];
+      rgb_data[i * 3 + 1] = bw_data[i];
+      rgb_data[i * 3 + 2] = bw_data[i];
+    }
+
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, r.width(), r.height(), 0, GL_RGB, GL_UNSIGNED_BYTE, rgb_data.data());
+
+    if (it->second->record) {
+      record_frame(r, it->first);
+    }
 
     if (it->second->visible) {
       request_new_frame(it->first, *it->second);
     }
+  }
+
+  void record_frame(const jpg_response& r, const std::string& ip)
+  {
+    const std::filesystem::path data_path{ "data" };
+
+    std::filesystem::create_directory(data_path);
+
+    const std::filesystem::path ip_path{ data_path / ip };
+
+    std::filesystem::create_directory(ip_path);
+
+    std::ostringstream name_stream;
+    name_stream << r.timestamp().time_since_epoch().count();
+    name_stream << ".bmp";
+
+    const std::filesystem::path img_path{ ip_path / name_stream.str() };
+
+    stbi_write_bmp(img_path.string().c_str(), r.width(), r.height(), 1, r.data());
   }
 
   void request_new_frame(const std::string& ip, stream_context& ctx)

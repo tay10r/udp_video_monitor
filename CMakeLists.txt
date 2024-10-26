@@ -18,7 +18,9 @@ find_package(libuv CONFIG REQUIRED)
 add_executable(monitor WIN32
   src/main.cpp
   src/stb_image.h
-  src/stb_image.c)
+  src/stb_image.c
+  src/stb_image_write.h
+  src/stb_image_write.c)
 target_link_libraries(monitor PUBLIC uikit::uikit uikit::main libuv::uv)
 target_compile_features(monitor PUBLIC cxx_std_20)
 
