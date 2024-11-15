@@ -16,6 +16,9 @@
 #include <map>
 #include <mutex>
 #include <thread>
+#include <vector>
+
+#include <stdint.h>
 
 #include <cassert>
 
@@ -24,6 +27,12 @@
 #endif
 
 namespace {
+
+auto
+to_handle(uv_udp_t* h) -> uv_handle_t*
+{
+  return reinterpret_cast<uv_handle_t*>(h);
+}
 
 using utc_clock = std::chrono::utc_clock;
 
@@ -148,6 +157,7 @@ private:
 
 class jpg_response;
 class discovery_response;
+class anomaly_response;
 
 class response_visitor
 {
@@ -157,6 +167,8 @@ public:
   virtual void visit(const jpg_response&) = 0;
 
   virtual void visit(const discovery_response&) = 0;
+
+  virtual void visit(const anomaly_response&) = 0;
 };
 
 class response
@@ -224,6 +236,30 @@ private:
   std::string m_ip_address;
 };
 
+class anomaly_response final : public response_base<anomaly_response>
+{
+public:
+  anomaly_response(std::string source, const double timestamp, const double level)
+    : source_(source)
+    , timestamp_(timestamp)
+    , level_(level)
+  {
+  }
+
+  [[nodiscard]] auto get_source() const -> const std::string& { return source_; }
+
+  [[nodiscard]] auto get_timestamp() const -> double { return timestamp_; }
+
+  [[nodiscard]] auto get_level() const -> double { return level_; }
+
+private:
+  std::string source_;
+
+  double timestamp_{};
+
+  double level_{};
+};
+
 static uv_async_t
 init_async(void* self)
 {
@@ -269,6 +305,103 @@ private:
   void* m_data{};
 
   callback m_callback{};
+};
+
+using anomaly_cb = void (*)(void*, std::string source, double time, double level);
+
+class anomaly_listener final
+{
+public:
+  anomaly_listener(uv_loop_t* loop, void* cb_data, anomaly_cb cb)
+    : cb_data_(cb_data)
+    , cb_(cb)
+  {
+    uv_udp_init(loop, &socket_);
+
+    uv_handle_set_data(to_handle(&socket_), this);
+  }
+
+  [[nodiscard]] auto setup(const char* ip, const int port) -> bool
+  {
+    sockaddr_in address{};
+
+    if (uv_ip4_addr(ip, port, &address) != 0) {
+      return false;
+    }
+
+    if (uv_udp_bind(&socket_, reinterpret_cast<const sockaddr*>(&address), UV_UDP_REUSEADDR) != 0) {
+      return false;
+    }
+
+    return uv_udp_recv_start(&socket_, on_alloc, on_read) == 0;
+  }
+
+  void close() { uv_close(to_handle(&socket_), nullptr); }
+
+protected:
+  static auto get_self(uv_handle_t* handle) -> anomaly_listener*
+  {
+    return static_cast<anomaly_listener*>(uv_handle_get_data(handle));
+  }
+
+  static void on_alloc(uv_handle_t* handle, const size_t size, uv_buf_t* buf)
+  {
+    auto* self = get_self(handle);
+    self->read_buffer_.resize(size);
+    buf->base = reinterpret_cast<char*>(self->read_buffer_.data());
+    buf->len = self->read_buffer_.size();
+  }
+
+  static void on_read(uv_udp_t* socket,
+                      const ssize_t read_size,
+                      const uv_buf_t* buf,
+                      const sockaddr* sender,
+                      unsigned int)
+  {
+    if (read_size < 0) {
+      // error
+      return;
+    }
+
+    if (read_size != 16) {
+      // we should just have two 64-bit floats: the timestamp and anomaly level
+      return;
+    }
+
+    if (!sender || (sender->sa_family != AF_INET)) {
+      return;
+    }
+
+    std::string source;
+
+    source.resize(256);
+
+    const auto ret = uv_ip4_name(reinterpret_cast<const sockaddr_in*>(sender), source.data(), source.size());
+    if (ret != 0) {
+      return;
+    }
+    const auto null_terminator = source.find('\0');
+    if (null_terminator != std::string::npos) {
+      source.resize(null_terminator);
+    }
+
+    auto* self = get_self(to_handle(socket));
+    auto* data = reinterpret_cast<const double*>(buf->base);
+    const auto timestamp = data[0];
+    const auto level = data[1];
+    if (self->cb_) {
+      self->cb_(self->cb_data_, std::move(source), timestamp, level);
+    }
+  }
+
+private:
+  uv_udp_t socket_{};
+
+  std::vector<uint8_t> read_buffer_;
+
+  void* cb_data_{};
+
+  anomaly_cb cb_{};
 };
 
 class worker final : public interpreter
@@ -324,6 +457,13 @@ protected:
     }
   }
 
+  static void on_anomaly(void* self_ptr, std::string source, double timestamp, double anomaly)
+  {
+    auto* self = static_cast<worker*>(self_ptr);
+    auto r = std::make_unique<anomaly_response>(std::move(source), timestamp, anomaly);
+    self->add_response(std::move(r));
+  }
+
   void run_thread()
   {
     if (const auto err = uv_ip4_addr(m_config.broadcast_ip.c_str(), COMM_PORT, &m_broadcast_address); err) {
@@ -337,6 +477,10 @@ protected:
 
     uv_handle_set_data(reinterpret_cast<uv_handle_t*>(&m_socket), this);
 
+    anomaly_listener anomaly_listener_(&m_loop, this, on_anomaly);
+
+    anomaly_listener_.setup("0.0.0.0", 5205);
+
     uv_udp_init(&m_loop, &m_socket);
 
     uv_udp_recv_start(&m_socket, on_alloc, on_read);
@@ -345,13 +489,15 @@ protected:
 
     uv_run(&m_loop, UV_RUN_DEFAULT);
 
+    /* close */
+
+    anomaly_listener_.close();
+
     m_broadcast_timer.close();
 
     uv_close(reinterpret_cast<uv_handle_t*>(&m_socket), nullptr);
 
     uv_close(reinterpret_cast<uv_handle_t*>(&m_command_handle), nullptr);
-
-    /* close */
 
     uv_run(&m_loop, UV_RUN_DEFAULT);
 
@@ -575,6 +721,25 @@ struct stream_context final
   }
 };
 
+struct time_series final
+{
+  std::size_t max_size{ 4096 };
+
+  std::vector<double> time_data;
+
+  std::vector<double> y_data;
+
+  void push_sample(double time, double y)
+  {
+    if (time_data.size() >= max_size) {
+      time_data.erase(time_data.begin());
+      y_data.erase(y_data.begin());
+    }
+    time_data.emplace_back(time);
+    y_data.emplace_back(y);
+  }
+};
+
 class app_impl final
   : public uikit::app
   , public response_visitor
@@ -612,9 +777,36 @@ public:
     }
 
     render_streams();
+
+    if (ImGui::Begin("Anomaly Chart")) {
+      render_anomaly_chart();
+    }
+    ImGui::End();
   }
 
 protected:
+  void render_anomaly_chart()
+  {
+    if (ImGui::Button("Clear")) {
+      m_anomaly_map.clear();
+    }
+
+    if (!ImPlot::BeginPlot("Anomaly Chart", ImVec2(-1, -1), ImPlotFlags_Crosshairs | ImPlotFlags_NoFrame)) {
+      return;
+    }
+
+    ImPlot::SetupAxes("Time", "Anomaly Level", ImPlotAxisFlags_AutoFit, ImPlotAxisFlags_AutoFit);
+
+    ImPlot::SetupAxisScale(ImAxis_X1, ImPlotScale_Time);
+
+    for (const auto& entry : m_anomaly_map) {
+      ImPlot::PlotLine(
+        entry.first.c_str(), entry.second.time_data.data(), entry.second.y_data.data(), entry.second.time_data.size());
+    }
+
+    ImPlot::EndPlot();
+  }
+
   void render_stream(const std::string& ip, stream_context& ctx)
   {
     ImPlot::SetCurrentContext(ctx.context);
@@ -709,6 +901,15 @@ protected:
     }
   }
 
+  void visit(const anomaly_response& r) override
+  {
+    auto it = m_anomaly_map.find(r.get_source());
+    if (it == m_anomaly_map.end()) {
+      it = m_anomaly_map.emplace(r.get_source(), time_series{}).first;
+    }
+    it->second.push_sample(r.get_timestamp(), r.get_level());
+  }
+
   void record_frame(const jpg_response& r, const std::string& ip)
   {
     const std::filesystem::path data_path{ "data" };
@@ -721,11 +922,11 @@ protected:
 
     std::ostringstream name_stream;
     name_stream << r.timestamp().time_since_epoch().count();
-    name_stream << ".bmp";
+    name_stream << ".png";
 
     const std::filesystem::path img_path{ ip_path / name_stream.str() };
 
-    stbi_write_bmp(img_path.string().c_str(), r.width(), r.height(), 1, r.data());
+    stbi_write_png(img_path.string().c_str(), r.width(), r.height(), 1, r.data(), r.width());
   }
 
   void request_new_frame(const std::string& ip, stream_context& ctx)
@@ -741,6 +942,8 @@ private:
   std::unique_ptr<worker> m_worker;
 
   std::map<std::string, std::unique_ptr<stream_context>> m_stream_map;
+
+  std::map<std::string, time_series> m_anomaly_map;
 };
 
 } // namespace
